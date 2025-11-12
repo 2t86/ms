@@ -1,0 +1,496 @@
+#!/bin/bash
+
+# Clothing size management CLI
+# Usage: mysize [command] [options]
+
+set -euo pipefail
+
+# Configuration
+DB_PATH="${HOME}/.mysize.sqlite"
+
+# Color settings
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Database initialization
+init_db() {
+    sqlite3 "$DB_PATH" <<EOF
+CREATE TABLE IF NOT EXISTS items (
+    id TEXT PRIMARY KEY,
+    category TEXT NOT NULL,
+    brand TEXT,
+    model TEXT,
+    size TEXT,
+    -- outerwear & tops
+    chest REAL,
+    length REAL,
+    shoulder REAL,
+    sleeve REAL,
+    -- bottoms
+    waist REAL,
+    rise REAL,
+    thigh REAL,
+    hem_width REAL,
+    -- footwear
+    us_size TEXT,
+    jp_size TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+EOF
+}
+
+# Generate hash ID from brand+model+size (sha1 last 7 chars)
+generate_id() {
+    local brand="${1:-}"
+    local model="${2:-}"
+    local size="${3:-}"
+    local input="${brand}${model}${size}"
+    echo -n "$input" | sha1sum | cut -c1-7
+}
+
+# Escape single quotes for SQL
+sql_escape() {
+    echo "${1//\'/\'\'}"
+}
+
+# Input prompt function (allows empty input)
+prompt_input() {
+    local prompt_msg="$1"
+    local default="${2:-}"
+    local value
+
+    if [ -n "$default" ]; then
+        echo -en "${BLUE}${prompt_msg}${NC} [${default}]: " >&2
+    else
+        echo -en "${BLUE}${prompt_msg}${NC}: " >&2
+    fi
+
+    read -r value
+
+    if [ -z "$value" ] && [ -n "$default" ]; then
+        echo "$default"
+    else
+        echo "$value"
+    fi
+}
+
+# Normalize category name
+normalize_category() {
+    local cat="$1"
+    case "$cat" in
+        outerwear|outer) echo "outerwear" ;;
+        tops|top) echo "tops" ;;
+        bottoms|bottom) echo "bottoms" ;;
+        footwear|foot|shoes) echo "footwear" ;;
+        *) echo "" ;;
+    esac
+}
+
+# add command - hybrid mode (with/without arguments)
+cmd_add() {
+    local category=$(normalize_category "${1:-}")
+
+    if [ -z "$category" ]; then
+        echo -e "${RED}Error: Please specify a category (outerwear/tops/bottoms/footwear)${NC}" >&2
+        return 1
+    fi
+
+    shift
+
+    # Parse arguments (option format)
+    local brand="" model="" size=""
+    local chest="" length="" shoulder="" sleeve=""
+    local waist="" rise="" thigh="" hem_width=""
+    local us_size="" jp_size=""
+
+    # オプション引数があれば処理
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -b|--brand) brand="$2"; shift 2 ;;
+            -m|--model) model="$2"; shift 2 ;;
+            -s|--size) size="$2"; shift 2 ;;
+            -c|--chest) chest="$2"; shift 2 ;;
+            -l|--length) length="$2"; shift 2 ;;
+            --shoulder) shoulder="$2"; shift 2 ;;
+            --sleeve) sleeve="$2"; shift 2 ;;
+            -w|--waist) waist="$2"; shift 2 ;;
+            -r|--rise) rise="$2"; shift 2 ;;
+            -t|--thigh) thigh="$2"; shift 2 ;;
+            -h|--hem-width) hem_width="$2"; shift 2 ;;
+            -u|--us-size) us_size="$2"; shift 2 ;;
+            -j|--jp-size) jp_size="$2"; shift 2 ;;
+            *)
+                echo -e "${RED}Unknown option: $1${NC}" >&2
+                return 1
+                ;;
+        esac
+    done
+
+    # Interactive input if arguments not provided
+    echo -e "${GREEN}=== Adding ${category} ===${NC}"
+    echo -e "${YELLOW}(Press Enter to skip)${NC}"
+
+    [ -z "$brand" ] && brand=$(prompt_input "Brand")
+    [ -z "$model" ] && model=$(prompt_input "Model")
+    [ -z "$size" ] && size=$(prompt_input "Size")
+
+    case "$category" in
+        outerwear|tops)
+            [ -z "$chest" ] && chest=$(prompt_input "Chest width (cm)")
+            [ -z "$length" ] && length=$(prompt_input "Length (cm)")
+            [ -z "$shoulder" ] && shoulder=$(prompt_input "Shoulder width (cm)")
+            [ -z "$sleeve" ] && sleeve=$(prompt_input "Sleeve length (cm)")
+            ;;
+        bottoms)
+            [ -z "$waist" ] && waist=$(prompt_input "Waist (cm)")
+            [ -z "$length" ] && length=$(prompt_input "Inseam (cm)")
+            [ -z "$rise" ] && rise=$(prompt_input "Rise (cm)")
+            [ -z "$thigh" ] && thigh=$(prompt_input "Thigh width (cm)")
+            [ -z "$hem_width" ] && hem_width=$(prompt_input "Hem width (cm)")
+            ;;
+        footwear)
+            [ -z "$us_size" ] && us_size=$(prompt_input "US size")
+            [ -z "$jp_size" ] && jp_size=$(prompt_input "JP size (cm)")
+            ;;
+    esac
+
+    # Generate ID
+    local item_id=$(generate_id "$brand" "$model" "$size")
+
+    # Check for duplicate
+    local exists=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM items WHERE id = '$item_id';")
+    if [ "$exists" -gt 0 ]; then
+        echo -e "${YELLOW}Item with ID $item_id already exists.${NC}" >&2
+        echo -en "${YELLOW}Overwrite? (y/N): ${NC}" >&2
+        read -r confirm
+        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+            echo "Cancelled"
+            return 0
+        fi
+        # Delete existing item
+        sqlite3 "$DB_PATH" "DELETE FROM items WHERE id = '$item_id';"
+    fi
+
+    # Insert into database
+    sqlite3 "$DB_PATH" <<EOF
+INSERT INTO items (id, category, brand, model, size, chest, length, shoulder, sleeve, waist, rise, thigh, hem_width, us_size, jp_size)
+VALUES (
+    '$item_id',
+    '$(sql_escape "$category")',
+    $([ -n "$brand" ] && echo "'$(sql_escape "$brand")'" || echo "NULL"),
+    $([ -n "$model" ] && echo "'$(sql_escape "$model")'" || echo "NULL"),
+    $([ -n "$size" ] && echo "'$(sql_escape "$size")'" || echo "NULL"),
+    $([ -n "$chest" ] && echo "$chest" || echo "NULL"),
+    $([ -n "$length" ] && echo "$length" || echo "NULL"),
+    $([ -n "$shoulder" ] && echo "$shoulder" || echo "NULL"),
+    $([ -n "$sleeve" ] && echo "$sleeve" || echo "NULL"),
+    $([ -n "$waist" ] && echo "$waist" || echo "NULL"),
+    $([ -n "$rise" ] && echo "$rise" || echo "NULL"),
+    $([ -n "$thigh" ] && echo "$thigh" || echo "NULL"),
+    $([ -n "$hem_width" ] && echo "$hem_width" || echo "NULL"),
+    $([ -n "$us_size" ] && echo "'$(sql_escape "$us_size")'" || echo "NULL"),
+    $([ -n "$jp_size" ] && echo "'$(sql_escape "$jp_size")'" || echo "NULL")
+);
+EOF
+
+    echo -e "${GREEN}[+] Added successfully (ID: $item_id)${NC}"
+}
+
+# list command - table format + simple format option
+cmd_list() {
+    local category=""
+    local simple_mode=false
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -s|--simple) simple_mode=true; shift ;;
+            *)
+                category=$(normalize_category "$1")
+                if [ -z "$category" ]; then
+                    echo -e "${RED}Unknown category: $1${NC}" >&2
+                    return 1
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # Build WHERE clause
+    local where_clause=""
+    if [ -n "$category" ]; then
+        where_clause="WHERE category = '$category'"
+    fi
+
+    # Simple mode
+    if [ "$simple_mode" = true ]; then
+        sqlite3 "$DB_PATH" <<EOF
+.mode line
+SELECT * FROM items $where_clause ORDER BY brand, model, size;
+EOF
+        return
+    fi
+
+    # Table mode (display different columns per category)
+    if [ -n "$category" ]; then
+        echo -e "${GREEN}=== $category ===${NC}"
+        case "$category" in
+            outerwear|tops)
+                sqlite3 -column -header "$DB_PATH" <<EOF
+SELECT id, brand, model, size, chest, length, shoulder, sleeve
+FROM items
+WHERE category = '$category'
+ORDER BY brand, model, size;
+EOF
+                ;;
+            bottoms)
+                sqlite3 -column -header "$DB_PATH" <<EOF
+SELECT id, brand, model, waist, length, rise, thigh, hem_width
+FROM items
+WHERE category = '$category'
+ORDER BY brand, model, size;
+EOF
+                ;;
+            footwear)
+                sqlite3 -column -header "$DB_PATH" <<EOF
+SELECT id, brand, model, us_size, jp_size
+FROM items
+WHERE category = '$category'
+ORDER BY brand, model, us_size;
+EOF
+                ;;
+        esac
+    else
+        # Display all categories
+        echo -e "${GREEN}=== All Items ===${NC}"
+        sqlite3 -column -header "$DB_PATH" <<EOF
+SELECT id, category, brand, model, size
+FROM items
+ORDER BY category, brand, model, size;
+EOF
+    fi
+}
+
+# edit command - interactive
+cmd_edit() {
+    local id="$1"
+
+    if [ -z "$id" ]; then
+        echo -e "${RED}Error: Please specify an ID${NC}" >&2
+        return 1
+    fi
+
+    # Get existing data
+    local existing=$(sqlite3 -separator "|" "$DB_PATH" "SELECT category, brand, model, size, chest, length, shoulder, sleeve, waist, rise, thigh, hem_width, us_size, jp_size FROM items WHERE id = '$id';")
+
+    if [ -z "$existing" ]; then
+        echo -e "${RED}Error: ID $id not found${NC}" >&2
+        return 1
+    fi
+
+    IFS='|' read -r category brand model size chest length shoulder sleeve waist rise thigh hem_width us_size jp_size <<< "$existing"
+
+    echo -e "${GREEN}=== Editing ID: $id (Category: $category) ===${NC}"
+    echo -e "${YELLOW}(Press Enter to keep current value)${NC}"
+
+    # Common fields
+    brand=$(prompt_input "Brand" "$brand")
+    model=$(prompt_input "Model" "$model")
+    size=$(prompt_input "Size" "$size")
+
+    # Category-specific fields
+    case "$category" in
+        outerwear|tops)
+            chest=$(prompt_input "Chest width (cm)" "$chest")
+            length=$(prompt_input "Length (cm)" "$length")
+            shoulder=$(prompt_input "Shoulder width (cm)" "$shoulder")
+            sleeve=$(prompt_input "Sleeve length (cm)" "$sleeve")
+            ;;
+        bottoms)
+            waist=$(prompt_input "Waist (cm)" "$waist")
+            length=$(prompt_input "Inseam (cm)" "$length")
+            rise=$(prompt_input "Rise (cm)" "$rise")
+            thigh=$(prompt_input "Thigh width (cm)" "$thigh")
+            hem_width=$(prompt_input "Hem width (cm)" "$hem_width")
+            ;;
+        footwear)
+            us_size=$(prompt_input "US size" "$us_size")
+            jp_size=$(prompt_input "JP size (cm)" "$jp_size")
+            ;;
+    esac
+
+    # Calculate new ID (in case brand/model/size changed)
+    local new_id=$(generate_id "$brand" "$model" "$size")
+
+    # If ID changed, check for conflicts
+    if [ "$new_id" != "$id" ]; then
+        local exists=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM items WHERE id = '$new_id';")
+        if [ "$exists" -gt 0 ]; then
+            echo -e "${RED}Error: Cannot update - new ID $new_id already exists${NC}" >&2
+            return 1
+        fi
+    fi
+
+    # Delete old record and insert new one (to handle ID change)
+    sqlite3 "$DB_PATH" <<EOF
+DELETE FROM items WHERE id = '$id';
+INSERT INTO items (id, category, brand, model, size, chest, length, shoulder, sleeve, waist, rise, thigh, hem_width, us_size, jp_size)
+VALUES (
+    '$new_id',
+    '$(sql_escape "$category")',
+    $([ -n "$brand" ] && echo "'$(sql_escape "$brand")'" || echo "NULL"),
+    $([ -n "$model" ] && echo "'$(sql_escape "$model")'" || echo "NULL"),
+    $([ -n "$size" ] && echo "'$(sql_escape "$size")'" || echo "NULL"),
+    $([ -n "$chest" ] && echo "$chest" || echo "NULL"),
+    $([ -n "$length" ] && echo "$length" || echo "NULL"),
+    $([ -n "$shoulder" ] && echo "$shoulder" || echo "NULL"),
+    $([ -n "$sleeve" ] && echo "$sleeve" || echo "NULL"),
+    $([ -n "$waist" ] && echo "$waist" || echo "NULL"),
+    $([ -n "$rise" ] && echo "$rise" || echo "NULL"),
+    $([ -n "$thigh" ] && echo "$thigh" || echo "NULL"),
+    $([ -n "$hem_width" ] && echo "$hem_width" || echo "NULL"),
+    $([ -n "$us_size" ] && echo "'$(sql_escape "$us_size")'" || echo "NULL"),
+    $([ -n "$jp_size" ] && echo "'$(sql_escape "$jp_size")'" || echo "NULL")
+);
+EOF
+
+    if [ "$new_id" != "$id" ]; then
+        echo -e "${GREEN}[+] Updated successfully (new ID: $new_id)${NC}"
+    else
+        echo -e "${GREEN}[+] Updated successfully${NC}"
+    fi
+}
+
+# delete command
+cmd_delete() {
+    local id="$1"
+
+    if [ -z "$id" ]; then
+        echo -e "${RED}Error: Please specify an ID${NC}" >&2
+        return 1
+    fi
+
+    # Check existence
+    local exists=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM items WHERE id = '$id';")
+
+    if [ "$exists" -eq 0 ]; then
+        echo -e "${RED}Error: ID $id not found${NC}" >&2
+        return 1
+    fi
+
+    # Confirmation prompt
+    echo -en "${YELLOW}Delete item ID $id? (y/N): ${NC}" >&2
+    read -r confirm
+
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        sqlite3 "$DB_PATH" "DELETE FROM items WHERE id = '$id';"
+        echo -e "${GREEN}[-] Deleted successfully${NC}"
+    else
+        echo "Cancelled"
+    fi
+}
+
+# Show help
+show_help() {
+    cat <<EOF
+mysize - Clothing size management CLI
+
+Usage:
+  mysize add <category> [options]     Add an item
+  mysize list [category] [--simple]   List items
+  mysize edit <id>                    Edit an item
+  mysize delete <id>                  Delete an item
+
+Categories:
+  outerwear, tops, bottoms, footwear
+
+Add options:
+  Common:
+    -b, --brand <name>      Brand name
+    -m, --model <name>      Model name
+    -s, --size <size>       Size
+
+  outerwear/tops:
+    -c, --chest <cm>        Chest width
+    -l, --length <cm>       Length
+    --shoulder <cm>         Shoulder width
+    --sleeve <cm>           Sleeve length
+
+  bottoms:
+    -w, --waist <cm>        Waist
+    -l, --length <cm>       Inseam
+    -r, --rise <cm>         Rise
+    -t, --thigh <cm>        Thigh width
+    -h, --hem-width <cm>    Hem width
+
+  footwear:
+    -u, --us-size <size>    US size
+    -j, --jp-size <cm>      JP size (cm)
+
+List options:
+  -s, --simple            Display in simple format
+
+Examples:
+  # Interactive mode
+  mysize add outerwear
+
+  # Direct add with options
+  mysize add tops -b "Uniqlo" -m "Supima" -s "L" -c 55 -l 70
+
+  # List items
+  mysize list
+  mysize list tops
+  mysize list --simple
+
+  # Edit and delete
+  mysize edit 5
+  mysize delete 3
+EOF
+}
+
+# Main
+main() {
+    # Initialize database
+    init_db
+
+    # Default to list if no arguments
+    if [ $# -eq 0 ]; then
+        cmd_list
+        return
+    fi
+
+    local command="$1"
+    shift
+
+    case "$command" in
+        add)
+            cmd_add "$@"
+            ;;
+        list|ls)
+            cmd_list "$@"
+            ;;
+        edit)
+            cmd_edit "$@"
+            ;;
+        delete|del|rm)
+            cmd_delete "$@"
+            ;;
+        # Direct category name means list
+        outerwear|tops|bottoms|footwear)
+            cmd_list "$command" "$@"
+            ;;
+        help|--help|-h)
+            show_help
+            ;;
+        *)
+            echo -e "${RED}Unknown command: $command${NC}" >&2
+            echo "Usage: mysize help"
+            return 1
+            ;;
+    esac
+}
+
+main "$@"
